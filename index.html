@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spotify Sync Lyrics</title>
+<style>
+body{margin:0;background:#111;color:#eee;font-family:Arial,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:24px}
+.card{background:#1b1b1b;border-radius:16px;padding:20px}
+input,button{font-size:16px;padding:12px;border-radius:10px;border:1px solid #444}
+input{background:#111;color:#fff;width:100%;box-sizing:border-box}
+button{background:#fff;color:#111;cursor:pointer;margin-top:10px}
+#lyrics{height:55vh;overflow:auto;margin-top:20px}
+.line{padding:8px 4px;color:#777;transition:.15s}
+.line.active{color:#fff;font-size:1.2em;font-weight:bold}
+.small{color:#aaa;font-size:13px}
+.cover{width:120px;height:120px;border-radius:12px;object-fit:cover;display:none}
+</style>
+</head>
+<body>
+<div class="wrap"><div class="card">
+<h1>🎵 Spotify Sync Lyrics</h1>
+<p class="small">Сначала вставь Client ID, затем запусти локальный сервер на порту 8888.</p>
+
+<label>Spotify Client ID</label>
+<input id="clientId" placeholder="Вставь Client ID сюда">
+
+<button id="connect">Подключить Spotify</button>
+<button id="demo">Демо</button>
+<br>
+<input id="lrcFile" type="file" accept=".lrc,.txt">
+
+<div id="status" class="small">Не подключено</div>
+<img id="cover" class="cover">
+<h2 id="track">—</h2>
+<div id="lyrics"></div>
+</div></div>
+
+<script>
+const REDIRECT_URI = "http://127.0.0.1:8888/";
+const SCOPES = "user-read-playback-state user-read-currently-playing";
+
+const $ = id => document.getElementById(id);
+let token = localStorage.getItem("spotify_token");
+let lyrics = [];
+let demo = false;
+
+function base64url(bytes){
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/,"");
+}
+
+async function pkce(){
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(64)));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return {verifier, challenge:base64url(new Uint8Array(digest))};
+}
+
+async function connect(){
+  const clientId = $("clientId").value.trim();
+  if(!clientId){ alert("Вставь Client ID."); return; }
+
+  localStorage.setItem("spotify_client_id",clientId);
+  const {verifier,challenge}=await pkce();
+  localStorage.setItem("pkce_verifier",verifier);
+
+  const p = new URLSearchParams({
+    client_id:clientId,
+    response_type:"code",
+    redirect_uri:REDIRECT_URI,
+    code_challenge_method:"S256",
+    code_challenge:challenge,
+    scope:SCOPES
+  });
+
+  location.href="https://accounts.spotify.com/authorize?"+p.toString();
+}
+
+async function exchangeCode(){
+  const code = new URLSearchParams(location.search).get("code");
+  if(!code) return;
+
+  const clientId = localStorage.getItem("spotify_client_id");
+  const verifier = localStorage.getItem("pkce_verifier");
+  if(!clientId || !verifier) return;
+
+  const body = new URLSearchParams({
+    client_id:clientId,
+    grant_type:"authorization_code",
+    code,
+    redirect_uri:REDIRECT_URI,
+    code_verifier:verifier
+  });
+
+  const r = await fetch("https://accounts.spotify.com/api/token",{
+    method:"POST",
+    headers:{"Content-Type":"application/x-www-form-urlencoded"},
+    body
+  });
+
+  const data = await r.json();
+  if(data.access_token){
+    localStorage.setItem("spotify_token",data.access_token);
+    history.replaceState({}, "", REDIRECT_URI);
+    token=data.access_token;
+    $("status").textContent="Spotify подключён";
+    poll();
+  }else{
+    $("status").textContent="Ошибка авторизации: "+(data.error_description||data.error);
+  }
+}
+
+function parseLRC(text){
+  return text.split(/\r?\n/).flatMap(line=>{
+    const m=[...line.matchAll(/\[(\d+):(\d+(?:\.\d+)?)\]/g)];
+    const text=line.replace(/\[\d+:\d+(?:\.\d+)?\]/g,"").trim();
+    return m.map(x=>({t:+x[1]*60 + +x[2],text}));
+  }).sort((a,b)=>a.t-b.t);
+}
+
+function renderLyrics(){
+  $("lyrics").innerHTML=lyrics.map((x,i)=>
+    `<div class="line" data-i="${i}">${escapeHtml(x.text||" ")}</div>`
+  ).join("");
+}
+
+function escapeHtml(s){
+  return s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function highlight(sec){
+  let idx=-1;
+  for(let i=0;i<lyrics.length;i++) if(lyrics[i].t<=sec) idx=i;
+  document.querySelectorAll(".line").forEach((e,i)=>e.classList.toggle("active",i===idx));
+  if(idx>=0){
+    const el=document.querySelector(`[data-i="${idx}"]`);
+    if(el) el.scrollIntoView({behavior:"smooth",block:"center"});
+  }
+}
+
+async function poll(){
+  if(!token || demo) return;
+  try{
+    const r=await fetch("https://api.spotify.com/v1/me/player",{
+      headers:{Authorization:"Bearer "+token}
+    });
+    if(r.status===401){$("status").textContent="Токен истёк — подключи Spotify снова.";return;}
+    const d=await r.json();
+    if(!d || !d.item){$("track").textContent="Ничего не играет";return;}
+    $("track").textContent=d.item.name+" — "+d.item.artists.map(a=>a.name).join(", ");
+    if(d.item.album?.images?.[0]){
+      $("cover").src=d.item.album.images[0].url;
+      $("cover").style.display="block";
+    }
+    highlight(d.progress_ms/1000);
+    $("status").textContent=d.is_playing?"▶ Сейчас играет":"⏸ Пауза";
+  }catch(e){$("status").textContent="Ошибка соединения с Spotify";}
+}
+
+$("connect").onclick=connect;
+
+$("lrcFile").onchange=async e=>{
+  const f=e.target.files[0];
+  if(!f)return;
+  lyrics=parseLRC(await f.text());
+  renderLyrics();
+};
+
+$("demo").onclick=()=>{
+  demo=true;
+  lyrics=[
+    {t:0,text:"Демо-синхронизация"},
+    {t:3,text:"Здесь показывается"},
+    {t:6,text:"как работает подсветка"},
+    {t:9,text:"строк по таймкодам"}
+  ];
+  renderLyrics();
+  let start=performance.now();
+  function loop(){
+    highlight((performance.now()-start)/1000);
+    if(demo) requestAnimationFrame(loop);
+  }
+  loop();
+};
+
+const saved=localStorage.getItem("spotify_client_id");
+if(saved)$("clientId").value=saved;
+exchangeCode();
+if(token&&!location.search)poll();
+</script>
+</body>
+</html>
